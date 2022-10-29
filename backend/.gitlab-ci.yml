@@ -1,0 +1,140 @@
+#set go cache
+.go-cache:
+  image: golang:1.16-alpine
+  cache:
+    paths:
+      - .cache
+  script:
+    - mkdir -p .cache
+    - export GOPATH="${CI_PROJECT_DIR}/.cache"
+    - make test
+
+variables:
+  VERSION: 1.0.${CI_PIPELINE_ID}
+  OUTPUT_NAME: api #compiled binary file  
+ 
+
+stages:
+  - build
+  - quality-testing
+  - build-image
+  - release 
+  - deploy
+ 
+
+build:
+  stage: build
+  extends: .go-cache
+  script:
+    - echo "ARTIFACT_JOB_ID=${CI_JOB_ID}" > CI_JOB_ID.txt
+    - cd backend
+    - go mod download
+    - go build -o ${OUTPUT_NAME}-${VERSION} ./cmd/api/
+  artifacts:
+    paths:
+      - backend/${OUTPUT_NAME}-${VERSION} #backend api file
+    reports:
+      dotenv: CI_JOB_ID.txt
+
+sonarqube-check:
+  stage: quality-testing
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - cd backend
+    - sonar-scanner -X -Dsonar.projectKey=${SONAR_PROJECT_KEY_BACK} -Dsonar.sources=. -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_BACKEND_TOKEN} -Dsonar.projectName="MOMO-STORE-BACKEND"
+  dependencies:
+    - build
+  allow_failure: true
+
+
+build-image:
+  stage: build-image
+  image: docker:20.10.16
+  variables: 
+    DOCKER_TLS_CERTDIR: "/certs"
+  services:
+    - docker:20.10.16-dind  
+  tags:
+    - my-runner #personal runner
+  before_script:    
+    - until docker info; do sleep 1; done
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd backend
+    - >
+      docker build
+      --build-arg VERSION=${VERSION}
+      --build-arg OUTPUT_NAME=${OUTPUT_NAME}
+      --tag $CI_REGISTRY_IMAGE/momo-backend:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY_IMAGE/momo-backend:$CI_COMMIT_SHA
+  dependencies:
+    - build
+
+#release image to gitlab registry
+upload-image-latest:
+  stage: release
+  image: docker:20.10.16  
+  variables: 
+    DOCKER_TLS_CERTDIR: "/certs"
+    GIT_STRATEGY: none 
+  services:
+      - docker:20.10.16-dind  
+  tags:
+    - my-runner #personal runner
+  before_script:
+    - until docker info; do sleep 1; done
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/momo-backend:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/momo-backend:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/momo-backend:latest
+    - docker push $CI_REGISTRY_IMAGE/momo-backend:latest
+
+deploy-app:
+  stage: deploy
+  image: alpine:3.15.0 
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual       
+  before_script:
+    - apk add openssh-client bash
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - chmod 700 /tmp
+  #на хостовой машине экспортируем переменные с гитлаба в окружение хоста в воздаваемый файл .env с помощью скрипта
+  script:
+    - scp ./docker-compose.yml  ${DEV_USER}@${DEV_HOST}:/home/${DEV_USER}/
+    - ssh ${DEV_USER}@${DEV_HOST}        
+      "/bin/bash -s " < ./backend/deploy_app.sh
+
+deploy-cluster:
+  stage: deploy
+  needs:
+    - upload-image-latest    
+  script:
+    - "curl -X POST --fail --form token=${INFRA_TRIGGER_TOKEN} --form ref=develop https://gitlab.praktikum-services.ru/api/v4/projects/${INFRA_PROJECT_ID}/trigger/pipeline"    
+
+#release artifact to nexus repository
+upload-release:
+  stage: release
+  only: 
+    changes:
+      - backend/*
+  script:
+    - cd ${CI_PROJECT_DIR}/backend
+    - >
+      curl -v -u  "${NEXUS_AUTH}" --upload-file ${OUTPUT_NAME}-${VERSION} "https://${NEXUS_SERVER}/repository/${NEXUS_REPO_BACK}/${VERSION}/${OUTPUT_NAME}-${VERSION}"

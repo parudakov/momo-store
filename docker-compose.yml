@@ -1,0 +1,36 @@
+version: "3.7"
+services:
+  backend:
+    # build:
+    #     context: backend
+    #     dockerfile: Dockerfile-standalone  
+    image: gitlab.praktikum-services.ru:5050/m.a.derkach.cloud/momo-store/momo-backend:latest
+    container_name: momo-store-backend 
+    environment:
+      - VIRTUAL_HOST=backend   
+    expose:
+      - '8081'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - momo_network
+  frontend:
+    # build:
+    #     context: frontend
+    #     dockerfile: Dockerfile-standalone
+    image: gitlab.praktikum-services.ru:5050/m.a.derkach.cloud/momo-store/momo-frontend:latest
+    container_name: momo-store-frontend    
+    environment:
+      - DEFAULT_HOST=backend
+      - VIRTUAL_PORT=8081
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    ports:
+      - '80:80'
+    depends_on: 
+      - backend 
+    networks:
+      - momo_network 
+
+networks:
+  momo_network:    
